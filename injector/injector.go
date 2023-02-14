@@ -21,6 +21,7 @@ var (
 	ErrInvalidAdmissionReviewObj     = errors.New("invalid admission review object")
 	ErrFailedToCreatePatch           = errors.New("failed to create patch")
 	ErrFailedToReadNodeSelectorTerms = errors.New("failed to load node selector terms")
+	ErrFailedToReadPreferenceTerms 	 = errors.New("failed to load preference terms")
 	ErrMissingConfiguration          = errors.New("missing configuration")
 	ErrInvalidConfiguration          = errors.New("invalid configuration")
 )
@@ -31,10 +32,13 @@ type PatchPath string
 // PatchPath values
 const (
 	// affinity
-	CreateAffinity              = "/spec/affinity"
-	CreateNodeAffinity          = "/spec/affinity/nodeAffinity"
-	AddRequiredDuringScheduling = "/spec/affinity/nodeAffinity/requiredDuringSchedulingIgnoredDuringExecution"
-	AddNodeSelectorTerms        = "/spec/affinity/nodeAffinity/requiredDuringSchedulingIgnoredDuringExecution/nodeSelectorTerms/-"
+	CreateAffinity              	= "/spec/affinity"
+	CreateNodeAffinity          	= "/spec/affinity/nodeAffinity"
+	AddRequiredDuringScheduling 	= "/spec/affinity/nodeAffinity/requiredDuringSchedulingIgnoredDuringExecution"
+	AddNodeSelectorTerms        	= "/spec/affinity/nodeAffinity/requiredDuringSchedulingIgnoredDuringExecution/nodeSelectorTerms/-"
+	AddPreferredDuringScheduling 	= "/spec/affinity/nodeAffinity/preferredDuringSchedulingIgnoredDuringExecution"
+	AddPreference 								= "/spec/affinity/nodeAffinity/preferredDuringSchedulingIgnoredDuringExecution/preference/-"
+
 	// tolerations
 	CreateTolerations = "/spec/tolerations"
 	AddTolerations    = "/spec/tolerations/-"
@@ -42,6 +46,7 @@ const (
 
 const (
 	nodeSelectorKey = "nodeSelectorTerms"
+	preferenceKey		= "preferenceTerms"
 	tolerationsKey  = "tolerations"
 	successStatus   = "Success"
 	annotationKey   = "namespace-node-affinity.idgenchev.github.com/applied-patch"
@@ -64,6 +69,7 @@ type JSONPatch struct {
 // NamespaceConfig is the per-namespace configuration
 type NamespaceConfig struct {
 	NodeSelectorTerms []corev1.NodeSelectorTerm `json:"nodeSelectorTerms"`
+	preferenceTerms		[]corev1.PreferenceTerm 	`json:"preferenceTerms"`
 	Tolerations       []corev1.Toleration       `json:"tolerations"`
 	ExcludedLabels    map[string]string         `json:"excludedLabels"`
 }
@@ -174,8 +180,8 @@ func (m *Injector) configForNamespace(namespace string) (*NamespaceConfig, error
 	err = yamlUnmarshal([]byte(namespaceConfigString), config)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %s", ErrInvalidConfiguration, err)
-	} else if config.NodeSelectorTerms == nil && config.Tolerations == nil {
-		return nil, fmt.Errorf("%w: at least one of nodeSelectorTerms or tolerations needs to be specified for %s", ErrInvalidConfiguration, namespace)
+	} else if config.NodeSelectorTerms == nil && config.PreferenceTerms == nil && config.Tolerations == nil {
+		return nil, fmt.Errorf("%w: at least one of nodeSelectorTerms, preferenceTerms, or tolerations needs to be specified for %s", ErrInvalidConfiguration, namespace)
 	}
 
 	return config, nil
@@ -192,6 +198,22 @@ func buildNodeSelectorTermsPath(podSpec corev1.PodSpec) PatchPath {
 		path = AddRequiredDuringScheduling
 	} else {
 		path = AddNodeSelectorTerms
+	}
+
+	return path
+}
+
+func buildPreferenceTermsPath(podSpec corev1.PodSpec) PatchPath {
+	var path PatchPath
+
+	if podSpec.Affinity == nil {
+		path = CreateAffinity
+	} else if podSpec.Affinity != nil && podSpec.Affinity.NodeAffinity == nil {
+		path = CreateNodeAffinity
+	} else if podSpec.Affinity.NodeAffinity != nil && podSpec.Affinity.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution == nil {
+		path = AddPreferredDuringScheduling
+	} else {
+		path = AddPreferenceTerms
 	}
 
 	return path
@@ -234,6 +256,36 @@ func buildNodeSelectorTermsPatch(path PatchPath, nodeSelectorTerms []corev1.Node
 	return patch, nil
 }
 
+func buildPreferenceTermsPatch(path PatchPath, preferenceTerms []corev1.PreferenceTerm) (JSONPatch, error) {
+	patch := JSONPatch{
+		Op:   "add",
+		Path: path,
+	}
+
+	patchAffinity := &corev1.Affinity{
+		NodeAffinity: &corev1.NodeAffinity{
+			PreferredDuringSchedulingIgnoredDuringExecution: &corev1.Preference{
+				PreferenceTerms: preferenceTerms,
+			},
+		},
+	}
+
+	switch path {
+	case AddPreferenceTerms:
+		patch.Value = patchAffinity.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution.PreferenceTerms
+	case AddPreferredDuringScheduling:
+		patch.Value = patchAffinity.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution
+	case CreateNodeAffinity:
+		patch.Value = patchAffinity.NodeAffinity
+	case CreateAffinity:
+		patch.Value = patchAffinity
+	default:
+		return JSONPatch{}, fmt.Errorf("%w: invalid patch path", ErrFailedToCreatePatch)
+	}
+
+	return patch, nil
+}
+
 func buildPatch(config *NamespaceConfig, podSpec corev1.PodSpec) ([]byte, error) {
 	patches := []JSONPatch{}
 
@@ -245,6 +297,16 @@ func buildPatch(config *NamespaceConfig, podSpec corev1.PodSpec) ([]byte, error)
 		}
 
 		patches = append(patches, nodeSelectorTermsPatch)
+	}
+	
+	if config.PreferenceTerms != nil {
+		preferenceTermsPatchPath := buildPreferenceTermsPath(podSpec)
+		preferenceTermsPatch, err := buildPreferenceTermsPatch(preferenceTermsPatchPath, config.PreferenceTerms)
+		if err != nil {
+			return nil, err
+		}
+
+		patches = append(patches, preferenceTermsPatch)
 	}
 
 	if config.Tolerations != nil {
